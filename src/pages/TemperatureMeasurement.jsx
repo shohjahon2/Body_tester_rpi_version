@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react'; // Добавили useEffect
 import { useNavigate } from 'react-router-dom';
 import Button from '../components/Button';
 import '../styles/pages/_temperature-measurement.scss';
@@ -7,34 +7,53 @@ const TemperatureMeasurement = () => {
   const navigate = useNavigate();
   const [temperature, setTemperature] = useState('');
 
+  // --- ИНТЕГРАЦИЯ С BACKEND ---
+  useEffect(() => {
+    // Функция для получения данных с Raspberry Pi
+    const fetchTemperature = async () => {
+      try {
+        // Замени localhost на IP адрес твоей Raspberry, если заходишь с другого устройства
+        const response = await fetch('http://localhost:8000/temperature');
+        const data = await response.json();
+        
+        if (data.temperature && data.temperature > 0) {
+          // Если датчик выдает температуру (например, > 30°C), фиксируем её
+          setTemperature(data.temperature.toString());
+        }
+      } catch (error) {
+        console.error("Ошибка подключения к датчику:", error);
+      }
+    };
+
+    // Запускаем опрос каждые 1000 мс (1 секунда)
+    const interval = setInterval(fetchTemperature, 1000);
+
+    // Очистка интервала при закрытии страницы
+    return () => clearInterval(interval);
+  }, []);
+  // --- КОНЕЦ ИНТЕГРАЦИИ ---
+
   const handleTemperatureChange = (e) => {
     const value = e.target.value;
-    // Allow empty string or valid numbers with decimal
     if (value === '' || /^\d*\.?\d*$/.test(value)) {
       setTemperature(value);
     }
   };
 
   const handleFinish = () => {
-    // Save temperature measurement
     localStorage.setItem('temperature', temperature);
-    
-    // Check if we're in "all measurements" mode
     const isAllMeasurementsMode = localStorage.getItem('isAllMeasurementsMode') === 'true';
     
     if (isAllMeasurementsMode) {
-      // Get next measurement from queue
       const measurementQueue = JSON.parse(localStorage.getItem('measurementQueue') || '[]');
       const currentIndex = parseInt(localStorage.getItem('currentMeasurementIndex') || '0');
       const nextIndex = currentIndex + 1;
       
       if (nextIndex < measurementQueue.length) {
-        // Navigate to next measurement
         localStorage.setItem('currentMeasurementIndex', nextIndex.toString());
         const nextMeasurement = measurementQueue[nextIndex];
         navigate(`/measurement/${nextMeasurement}`);
       } else {
-        // All measurements done, go to success
         localStorage.removeItem('measurementQueue');
         localStorage.removeItem('currentMeasurementIndex');
         localStorage.removeItem('isAllMeasurementsMode');

@@ -37,7 +37,7 @@ const AgeInput = () => {
   const handleNext = () => {
     // Save age to localStorage
     localStorage.setItem('age', age.toString());
-    navigate('/coin-drop');
+    navigate('/selection');
   };
 
   return (

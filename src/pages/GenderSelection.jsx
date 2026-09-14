@@ -33,6 +33,7 @@ const GenderSelection = () => {
         navigate('/measurement/temperature');
       } else if (selectedMeasurement === 'weight-height') {
         navigate('/measurement/weight-height');
+        fetch()
       } else if (selectedMeasurement === 'oxygen') {
         navigate('/measurement/oxygen');
       } else if (selectedMeasurement === 'blood-pressure') {

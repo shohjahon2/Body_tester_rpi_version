@@ -5,7 +5,7 @@ import MainLayout from './layout/MainLayout';
 import Registration from './pages/Registration';
 import Home from './pages/Home';
 import AgeInput from './pages/AgeInput';
-import CoinDrop from './pages/CoinDrop';
+
 import Selection from './pages/Selection';
 import GenderSelection from './pages/GenderSelection';
 import TemperatureMeasurement from './pages/TemperatureMeasurement';
@@ -23,7 +23,7 @@ function App() {
             <Route path="/" element={<Registration />} />
             <Route path="/home" element={<Home />} />
             <Route path="/age-input" element={<AgeInput />} />
-            <Route path="/coin-drop" element={<CoinDrop />} />
+        
             <Route path="/selection" element={<Selection />} />
             <Route path="/gender-selection" element={<GenderSelection />} />
             <Route path="/measurement/weight-height" element={<WeightHeightMeasurement />} />
