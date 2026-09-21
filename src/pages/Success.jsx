@@ -55,6 +55,20 @@ const Success = () => {
     console.log('========================================');
     console.log('To\'liq ma\'lumotlar:', JSON.stringify(allData, null, 2));
     console.log('========================================');
+
+    // Kiosk API: agar bemor identify/enroll orqali aniqlangan bo'lsa,
+    // yig'ilgan o'lchovlarni clinic backendga yuborish.
+    const patientId = localStorage.getItem('patientId');
+    if (!userData.isGuest && patientId) {
+      fetch('http://localhost:8000/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ patient_id: Number(patientId) }),
+      })
+        .then(res => res.json())
+        .then(result => console.log('Backendga yuborish natijasi:', result))
+        .catch(err => console.warn('Backendga yuborib bo\'lmadi:', err));
+    }
   }, []);
 
   const handleHome = () => {
@@ -70,7 +84,9 @@ const Success = () => {
     localStorage.removeItem('bloodPressureDiastolic');
     localStorage.removeItem('pulse');
     localStorage.removeItem('selectedMeasurement');
-    
+    localStorage.removeItem('patientId');
+    localStorage.removeItem('pendingEmbedding');
+
     navigate('/');
   };
 

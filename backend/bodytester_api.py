@@ -226,7 +226,20 @@ def _check_embedding(embedding):
 
 class BodytesterClient:
 
-    def __init__(self, base_url, serial_number, secret, timeout=15):
+    def __init__(self, base_url, serial_number, secret, timeout=15,
+                 on_token_401=None, on_new_token=None, on_patient_not_found=None):
+        """
+        on_token_401         — token so'roviga 401 kelganda (hujjat: kesh
+                                butunlay o'chiriladi)
+        on_new_token          — YANGI token olinganda, ya'ni keshdagisi emas
+                                (hujjat: darhol sinxronlang)
+        on_patient_not_found  — o'lchovga 404 kelganda (hujjat: bemor
+                                keshdan o'chiriladi va sinxronlash so'raladi)
+
+        Uchchalasi ham fonda, alohida oqimda chaqiriladi — so'rov
+        oqimini bloklamaslik va qulf (_lock) qayta kirishidan qochish
+        uchun.
+        """
         self.base_url = base_url.rstrip("/")
         self.serial_number = serial_number
         self._secret = secret
@@ -235,6 +248,20 @@ class BodytesterClient:
         self._token = None
         self._token_until = 0.0
         self._lock = threading.Lock()
+        self.on_token_401 = on_token_401
+        self.on_new_token = on_new_token
+        self.on_patient_not_found = on_patient_not_found
+
+    @staticmethod
+    def _fire(callback, *args):
+        if callback is None:
+            return
+        def run():
+            try:
+                callback(*args)
+            except Exception:
+                log.exception("Callback xatosi")
+        threading.Thread(target=run, daemon=True, name="bodytester-callback").start()
 
     def _get_token(self, force=False):
         with self._lock:
@@ -247,9 +274,12 @@ class BodytesterClient:
             )
             if r.status_code != 200:
                 self._token = None
+                if r.status_code == 401:
+                    self._fire(self.on_token_401)
                 raise ApiError("Token olinmadi — " + error_text(r))
             self._token = r.json()["access"]
             self._token_until = time.time() + TOKEN_TTL_SEC
+            self._fire(self.on_new_token)
             return self._token
 
     def _post(self, path, payload):
@@ -265,6 +295,27 @@ class BodytesterClient:
                 self.base_url + path, json=payload, timeout=self.timeout,
                 headers={"Authorization": "Bearer " + token},
             )
+            if resp.status_code not in (401, 403):
+                break
+        return resp
+
+    def _get(self, path_or_url, params=None):
+        """
+        Token bilan GET. `path_or_url` to'liq havola (http bilan
+        boshlansa — sinxronlash javobidagi `next` havolasi) yoki
+        `/clinic/...` yo'li bo'lishi mumkin.
+        """
+        resp = None
+        for attempt in (1, 2):
+            token = self._get_token(force=(attempt == 2))
+            headers = {"Authorization": "Bearer " + token}
+            if path_or_url.startswith("http"):
+                resp = self.session.get(path_or_url, timeout=self.timeout, headers=headers)
+            else:
+                resp = self.session.get(
+                    self.base_url + path_or_url, params=params,
+                    timeout=self.timeout, headers=headers,
+                )
             if resp.status_code not in (401, 403):
                 break
         return resp
@@ -310,9 +361,38 @@ class BodytesterClient:
             # skipped_count=1 — bu o'lchov avval ham yetib borgan (javob
             # yo'lda yo'qolgan). Xato emas: idempotentlik aynan shu.
             return SENT, r.json().get("message", "")
-        if r.status_code in (400, 404):
+        if r.status_code == 404:
+            self._fire(self.on_patient_not_found, patient_id)
+            return REJECTED, error_text(r)
+        if r.status_code == 400:
             return REJECTED, error_text(r)
         return QUEUED, error_text(r)
+
+    # --- yuz keshi (hujjat, 5-bo'lim) ---
+
+    def faces_sync(self, model_version, since=None):
+        """GET /clinic/faces/sync/ — kesh sinxronlashining birinchi sahifasi."""
+        params = {"model_version": model_version}
+        if since:
+            params["since"] = since
+        r = self._get("/clinic/faces/sync/", params=params)
+        if r.status_code != 200:
+            raise ApiError(error_text(r))
+        return r.json()
+
+    def faces_sync_page(self, next_link):
+        """Javobdagi `next` havolasi bo'yicha keyingi sahifa."""
+        r = self._get(next_link)
+        if r.status_code != 200:
+            raise ApiError(error_text(r))
+        return r.json()
+
+    def faces_ids(self, model_version):
+        """GET /clinic/faces/ids/ — total bilan solishtirish uchun."""
+        r = self._get("/clinic/faces/ids/", params={"model_version": model_version})
+        if r.status_code != 200:
+            raise ApiError(error_text(r))
+        return r.json()
 
 
 def client_from_env():

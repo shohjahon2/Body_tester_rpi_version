@@ -1,3 +1,4 @@
+import base64
 import serial
 import time
 import os
@@ -5,10 +6,11 @@ import logging
 import statistics
 import uvicorn
 import numpy as np
+import requests
 import threading
 from typing import Optional
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from smbus2 import SMBus
@@ -16,9 +18,32 @@ from collections import deque
 from hx711_weight_sensor import HX711
 
 import bodytester_api as bt
+import face_cache
+import face_recognition
+
+
+def _load_dotenv():
+    """.env faylini (bo'lsa) os.environ ga yuklaydi. Maxfiy kalitlar
+    kodga yozilmasligi uchun — yangi pip bog'liqlik qo'shmaslik uchun
+    o'zimiz o'qiymiz."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("bodytester.server")
 
 # --- НАСТРОЙКИ ---
 MAX_DISTANCE = 2000
@@ -80,6 +105,24 @@ QUEUE_PATH = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_measurements.json"),
 )
 measurement_queue = bt.MeasurementQueue(api_client, QUEUE_PATH) if api_client else None
+
+# --- Yuz keshi (Kiosk API qo'llanmasi, 5-bo'lim) ---
+# Kesh mavjud bo'lmagan client bilan ham ishlaydi (bo'sh qoladi, find_match
+# doim None qaytaradi) — shuning uchun sozlanmagan holatda ham xavfsiz.
+FACE_CACHE_PATH = os.getenv(
+    "BODYTESTER_FACE_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_cache.sqlite3"),
+)
+cache = face_cache.FaceCache(FACE_CACHE_PATH)
+
+if api_client:
+    api_client.on_token_401 = cache.clear
+    api_client.on_new_token = lambda: face_cache.sync(api_client, cache, bt.MODEL_VERSION)
+    api_client.on_patient_not_found = lambda pid: (
+        cache.remove(pid),
+        face_cache.sync(api_client, cache, bt.MODEL_VERSION),
+    )
+    face_cache.start_sync_worker(api_client, cache, bt.MODEL_VERSION)
 
 if api_config_error:
     print(f"⚠️ Backend'ga yuborish o'chiq: {api_config_error}")
@@ -399,6 +442,148 @@ class SubmitRequest(BaseModel):
     recommendation: Optional[str] = None
 
 
+class SavePhotoRequest(BaseModel):
+    photo: str            # data:image/png;base64,... ko'rinishidagi rasm
+    name: Optional[str] = None
+
+
+PHOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "photos")
+
+
+def _persist_photo(photo_data_url, name):
+    """Base64 rasmni backend/photos/ ga yozadi. Qaytaradi: fayl nomi."""
+    header, _, b64data = photo_data_url.partition(",")
+    raw = base64.b64decode(b64data or header)
+    ext = "jpg" if "jpeg" in header or "jpg" in header else "png"
+
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
+    safe_name = "".join(c for c in (name or "guest") if c.isalnum() or c in "-_") or "guest"
+    filename = f"{int(time.time())}_{safe_name}.{ext}"
+    with open(os.path.join(PHOTOS_DIR, filename), "wb") as f:
+        f.write(raw)
+    return filename
+
+
+@app.post("/save-photo")
+def save_photo(req: SavePhotoRequest):
+    """Rasmni diskka saqlaydi (umumiy yordamchi vosita, yozuv uchun)."""
+    try:
+        filename = _persist_photo(req.photo, req.name)
+    except (ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={"detail": f"Rasmni o'qib bo'lmadi: {e}"})
+    return {"status": "saved", "filename": filename}
+
+
+# ------------------------------------------------------------ yuz tanish
+# Kiosk API qo'llanmasi, 2- va 3-bo'lim: rasmdan ArcFace vektor hisoblanadi,
+# so'ng identify/enroll bilan bemor patient_id'i olinadi.
+
+class FaceIdentifyRequest(BaseModel):
+    photo: str
+    name: Optional[str] = None
+
+
+class FaceEnrollRequest(BaseModel):
+    embedding: list
+    quality_score: Optional[float] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    gender: Optional[str] = None
+    age: Optional[int] = None
+    phone_number: Optional[str] = None
+
+
+@app.post("/face/identify")
+def face_identify(req: FaceIdentifyRequest):
+    """
+    Kiosk API qo'llanmasi, 3-bo'lim: avval lokal keshdan qidiriladi
+    (serverga so'rovsiz), faqat topilmasa yoki noaniq bo'lsa server
+    chaqiriladi. Kamera doimiy skanerlaydi — bo'sh kadr ("no_face")
+    diskka yozilmaydi, aks holda fotolar papkasi to'lib ketadi.
+    """
+    if api_client is None:
+        return {"status": "not_configured"}
+
+    try:
+        result = face_recognition.embed_photo(req.photo)
+    except Exception as e:
+        log.exception("Yuz embeddingini hisoblashda xato")
+        return {"status": "error", "detail": str(e)}
+
+    if result is None:
+        return {"status": "no_face"}
+    embedding, quality_score = result
+
+    try:
+        _persist_photo(req.photo, req.name)
+    except (ValueError, TypeError) as e:
+        log.warning("Rasmni saqlab bo'lmadi: %s", e)
+
+    local = cache.find_match(embedding)
+    if local is not None:
+        patient_id, similarity, name = local
+        resp = {"status": "found", "patient_id": patient_id,
+                "similarity": similarity, "source": "cache"}
+        if name:
+            resp["name"] = name
+        return resp
+
+    try:
+        identify_result = api_client.identify(embedding)
+    except (bt.ApiError, requests.RequestException) as e:
+        return {"status": "error", "detail": str(e)}
+
+    if identify_result.get("status") == "found":
+        # Server ism qaytaradi (kesh esa hech qachon) — shu bilan birga
+        # keshni ham "davolaymiz": keyingi safar shu bemor to'g'ridan-to'g'ri
+        # (ismi bilan) keshdan topiladi, serverga qayta so'rov ketmaydi.
+        full_name = " ".join(
+            x for x in [identify_result.get("first_name"), identify_result.get("last_name")] if x
+        ).strip()
+        if full_name:
+            identify_result["name"] = full_name
+        cache.upsert(identify_result["patient_id"], embedding, name=full_name or None)
+    elif identify_result.get("status") == "not_found":
+        identify_result["embedding"] = embedding
+        identify_result["quality_score"] = quality_score
+    return identify_result
+
+
+@app.post("/face/enroll")
+def face_enroll(req: FaceEnrollRequest):
+    if api_client is None:
+        return {"status": "not_configured"}
+
+    patient = {k: v for k, v in {
+        "first_name": req.first_name,
+        "last_name": req.last_name,
+        "gender": req.gender,
+        "age": req.age,
+        "phone_number": req.phone_number,
+    }.items() if v is not None}
+
+    try:
+        result = api_client.enroll(req.embedding, quality_score=req.quality_score, **patient)
+    except (bt.ApiError, requests.RequestException) as e:
+        return {"status": "error", "detail": str(e)}
+
+    if result.get("patient_id") is not None:
+        # Hujjat, "Keshni yangilash": keyingi sinxronlashni kutmasdan
+        # darhol keshga qo'shiladi. Ism ham shu yerda saqlanadi — bu
+        # qurilma sinxronlash orqali hech qachon ism olmaydi.
+        full_name = " ".join(
+            x for x in [result.get("first_name"), result.get("last_name")] if x
+        ).strip()
+        cache.upsert(result["patient_id"], req.embedding, name=full_name or None)
+
+    if result.get("possible_duplicate_of"):
+        log.warning("Yangi bemor (%s) mavjud yozuvga o'xshaydi: patient_id=%s, o'xshashlik=%s",
+                    result.get("patient_id"), result["possible_duplicate_of"],
+                    result.get("duplicate_similarity"))
+
+    return {"status": "enrolled", **result}
+
+
 @app.post("/session/start")
 def session_start():
     """
@@ -451,6 +636,149 @@ def queue_status():
     if measurement_queue is None:
         return {"enabled": False, "detail": api_config_error}
     return {"enabled": True, "pending": measurement_queue.pending()}
+
+
+FACE_CACHE_VIEW_HTML = """<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuz keshi — sinxronlash</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px; min-height: 100vh;
+    background: #0b1220; color: #e6edf3;
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }
+  .card {
+    width: 100%; max-width: 520px; background: #121a2b;
+    border: 1px solid #22304a; border-radius: 16px; padding: 28px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8b9bb4; font-size: 13px; margin-bottom: 24px; }
+  .count { font-size: 56px; font-weight: 700; color: #54ffff; line-height: 1; }
+  .count-label { color: #8b9bb4; font-size: 14px; margin-top: 4px; }
+  .rows { margin-top: 24px; border-top: 1px solid #22304a; }
+  .row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 0; border-bottom: 1px solid #22304a; font-size: 14px;
+  }
+  .row .k { color: #8b9bb4; }
+  .row .v { font-weight: 600; text-align: right; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.ok { background: rgba(84,255,255,0.15); color: #54ffff; }
+  .badge.bad { background: rgba(255,90,90,0.15); color: #ff5a5a; }
+  .error {
+    margin-top: 20px; padding: 12px 16px; border-radius: 10px;
+    background: rgba(255,90,90,0.12); border: 1px solid rgba(255,90,90,0.4);
+    color: #ff8a8a; font-size: 13px; display: none; word-break: break-word;
+  }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; background:#54ffff; animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  .updated { color: #4a5a78; font-size: 12px; margin-top: 18px; text-align: center; }
+  .ids-title { margin-top: 24px; font-size: 13px; color: #8b9bb4; }
+  .ids {
+    margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px;
+    max-height: 260px; overflow-y: auto; padding-right: 4px;
+  }
+  .id-chip {
+    background: #1a2540; border: 1px solid #22304a; border-radius: 8px;
+    padding: 6px 12px; font-size: 13px; font-variant-numeric: tabular-nums;
+  }
+  .empty { color: #4a5a78; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="dot"></span>Yuz keshi sinxronlashi</h1>
+    <div class="sub">Har 2 soniyada avtomatik yangilanadi</div>
+
+    <div class="count" id="count">—</div>
+    <div class="count-label">keshdagi bemorlar soni</div>
+
+    <div class="rows">
+      <div class="row"><span class="k">Backend</span><span class="v" id="backend">—</span></div>
+      <div class="row"><span class="k">model_version</span><span class="v" id="model_version">—</span></div>
+      <div class="row"><span class="k">threshold</span><span class="v" id="threshold">—</span></div>
+      <div class="row"><span class="k">margin</span><span class="v" id="margin">—</span></div>
+      <div class="row"><span class="k">Oxirgi sinxronlash</span><span class="v" id="last_synced_at">—</span></div>
+    </div>
+
+    <div class="error" id="error"></div>
+
+    <div class="ids-title">Keshdagi patient_id lar</div>
+    <div class="ids" id="ids"></div>
+
+    <div class="updated" id="updated"></div>
+  </div>
+
+<script>
+async function tick() {
+  try {
+    const res = await fetch('/face/cache/status', { cache: 'no-store' });
+    const data = await res.json();
+
+    document.getElementById('count').textContent = data.count;
+
+    const idsEl = document.getElementById('ids');
+    const ids = data.patient_ids || [];
+    idsEl.innerHTML = ids.length
+      ? ids.map(id => '<span class="id-chip">#' + id + '</span>').join('')
+      : '<span class="empty">kesh bo\\'sh</span>';
+    document.getElementById('model_version').textContent = data.model_version || '—';
+    document.getElementById('threshold').textContent = data.threshold ?? '—';
+    document.getElementById('margin').textContent = data.margin ?? '—';
+    document.getElementById('last_synced_at').textContent = data.last_synced_at || 'hali yo\\'q';
+
+    const backendEl = document.getElementById('backend');
+    backendEl.innerHTML = data.backend_configured
+      ? '<span class="badge ok">ulangan</span>'
+      : '<span class="badge bad">sozlanmagan</span>';
+
+    const errEl = document.getElementById('error');
+    if (data.last_sync_error) {
+      errEl.style.display = 'block';
+      errEl.textContent = 'Oxirgi sinxronlash xatosi: ' + data.last_sync_error;
+    } else {
+      errEl.style.display = 'none';
+    }
+
+    document.getElementById('updated').textContent =
+      'so\\'nggi tekshiruv: ' + new Date().toLocaleTimeString('uz-UZ');
+  } catch (err) {
+    document.getElementById('updated').textContent = 'Backendga ulanib bo\\'lmadi...';
+  }
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/face/cache/status")
+def face_cache_status():
+    """Diagnostika: keshda nechta yuz bor va oxirgi sinxronlash holati."""
+    return {
+        "count": cache.count(),
+        "patient_ids": sorted(cache.ids()),
+        "model_version": cache.model_version(),
+        "threshold": cache.threshold(),
+        "margin": cache.margin(),
+        "last_synced_at": cache.last_synced_at(),
+        "last_sync_error": cache.last_sync_error(),
+        "backend_configured": api_client is not None,
+    }
+
+
+@app.get("/face/cache/view")
+def face_cache_view():
+    """Yuz keshi sinxronlashini ko'rish uchun bitta sahifa (avtomatik yangilanadi)."""
+    return HTMLResponse(FACE_CACHE_VIEW_HTML)
 
 
 if __name__ == "__main__":

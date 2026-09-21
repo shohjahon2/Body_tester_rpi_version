@@ -26,6 +26,12 @@ yarn-error.log*
 /venv
 /backend/__pycache__
 *.pyc
+/backend/photos
+/backend/pending_measurements.json
+/backend/.env
+
+# yuz keshi — bemorlarning biometrik vektorlarini saqlaydi, versiyalashga kirmasin
+/backend/face_cache.sqlite3*
 
 # contains a hardcoded API secret; superseded by server.py + bodytester_api.py
 /backend/server_legacy.py

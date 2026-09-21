@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { FaPlus, FaMinus } from 'react-icons/fa';
 import Button from '../components/Button';
@@ -7,6 +7,16 @@ import '../styles/pages/_age-input.scss';
 const AgeInput = () => {
   const navigate = useNavigate();
   const [age, setAge] = useState(0);
+
+  useEffect(() => {
+    // Kiosk API: yuz orqali taniqli bemor (patientId bor, hali
+    // ro'yxatdan o'tkazilishi kerak bo'lgan pendingEmbedding yo'q) —
+    // yoshi allaqachon backendda bor, qayta so'ralmaydi.
+    const known = localStorage.getItem('patientId') && !localStorage.getItem('pendingEmbedding');
+    if (known) {
+      navigate('/selection', { replace: true });
+    }
+  }, [navigate]);
 
   const handleDecrease = () => {
     if (age > 0) {

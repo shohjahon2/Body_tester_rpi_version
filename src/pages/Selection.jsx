@@ -40,6 +40,13 @@ const Selection = () => {
   ];
 
   const handleCardClick = (card) => {
+    // Alohida bo'lim tanlanmoqda — oldingi "Hammasini tanlash" seansidan
+    // qolib ketgan navbatni tozalash kerak, aks holda GenderSelection
+    // shu eski navbatning joriy bosqichiga (masalan oxygenga) olib ketaveradi.
+    localStorage.removeItem('measurementQueue');
+    localStorage.removeItem('currentMeasurementIndex');
+    localStorage.removeItem('isAllMeasurementsMode');
+
     // Store selected measurement type and navigate to gender selection
     localStorage.setItem('selectedMeasurement', card.id);
     navigate('/gender-selection');
