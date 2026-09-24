@@ -10,7 +10,7 @@ const Success = () => {
   useEffect(() => {
     // Collect all entered data
     const userData = JSON.parse(localStorage.getItem('userData') || '{}');
-    const age = localStorage.getItem('age');
+    const birthDate = localStorage.getItem('birthDate');
     const gender = localStorage.getItem('gender');
     const temperature = localStorage.getItem('temperature');
     const weight = localStorage.getItem('weight');
@@ -28,7 +28,7 @@ const Success = () => {
         photo: userData.photo ? 'Photo captured' : null
       },
       personalInfo: {
-        age: age || 'N/A',
+        birthDate: birthDate || 'N/A',
         gender: gender || 'N/A'
       },
       measurements: {
@@ -74,7 +74,7 @@ const Success = () => {
   const handleHome = () => {
     // Clear all data when going home
     localStorage.removeItem('userData');
-    localStorage.removeItem('age');
+    localStorage.removeItem('birthDate');
     localStorage.removeItem('gender');
     localStorage.removeItem('temperature');
     localStorage.removeItem('weight');

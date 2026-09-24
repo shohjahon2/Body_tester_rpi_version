@@ -40,6 +40,17 @@ SENT = "sent"          # saqlandi
 QUEUED = "queued"      # vaqtinchalik muammo — keyin avtomatik qayta yuboriladi
 REJECTED = "rejected"  # server qat'iy rad etdi — qayta yuborish foydasiz
 
+# Qayta urinish siyosati (hujjat, 10-bo'lim): 429'da server aytgan
+# Retry-After hurmat qilinadi; 5xx/tarmoq uzilishida orqaga chekinish —
+# har muvaffaqiyatsizlikda ikki hissa, 30 daqiqadan oshmaydi.
+RETRY_BACKOFF_START = 30
+RETRY_BACKOFF_MAX = 30 * 60
+
+# flush() dan qaytadigan belgi: xato bor, lekin Retry-After yo'q — chaqiruvchi
+# orqaga chekinishni o'zi hisoblasin (aniq soniya emas, shu sababdan alohida
+# obyekt — 0 va None bilan chalkashmasin).
+BACKOFF = object()
+
 # Server qabul qiladigan chegaralar (qo'llanma, 7-bo'lim).
 BOUNDS = {
     "heart_rate":    (0, 300, int),
@@ -195,7 +206,12 @@ class SessionCache:
 # ------------------------------------------------------------ server
 
 class ApiError(Exception):
-    pass
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        # 429 da server qaytargan Retry-After (soniya) — qayta urinish
+        # shuncha kutishi kerak (hujjat, 10-bo'lim). Boshqa xatolarda None,
+        # chaqiruvchi orqaga chekinish (exponential backoff) qo'llaydi.
+        self.retry_after = retry_after
 
 
 def error_text(resp):
@@ -214,6 +230,20 @@ def error_text(resp):
     if isinstance(data, dict) and "detail" in data:
         return "%s: %s" % (resp.status_code, data["detail"])
     return "%s: %s" % (resp.status_code, json.dumps(data, ensure_ascii=False)[:300])
+
+
+def _parse_retry_after(resp, default=60):
+    """429 javobidagi Retry-After (soniya). Yo'q/yaroqsiz bo'lsa server
+    odatda kutadigan qiymat (hujjat, 10-bo'lim: "odatda 60")."""
+    try:
+        return max(1, int(resp.headers.get("Retry-After", default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _raise_for_error(resp):
+    retry_after = _parse_retry_after(resp) if resp.status_code == 429 else None
+    raise ApiError(error_text(resp), retry_after=retry_after)
 
 
 def _check_embedding(embedding):
@@ -328,13 +358,15 @@ class BodytesterClient:
                        {"embedding": _check_embedding(embedding),
                         "model_version": MODEL_VERSION})
         if r.status_code != 200:
-            raise ApiError(error_text(r))
+            _raise_for_error(r)
         return r.json()
 
     def enroll(self, embedding, quality_score=None, **patient):
         """
         Faqat identify "not_found" qaytarganda chaqiring.
-        patient: first_name, last_name, gender ("M"/"F"), age, phone_number
+        patient: first_name, last_name, gender ("M"/"F"), birth_date
+                 ("1992-05-17", kalendardan — yosh yuborilmaydi, server
+                 o'zi hisoblaydi), phone_number
         """
         payload = {k: v for k, v in patient.items() if v not in (None, "")}
         payload["embedding"] = _check_embedding(embedding)
@@ -343,30 +375,38 @@ class BodytesterClient:
             payload["quality_score"] = float(quality_score)
         r = self._post("/clinic/patients/", payload)
         if r.status_code != 201:
-            raise ApiError(error_text(r))
+            _raise_for_error(r)
         return r.json()
 
     # --- o'lchov ---
 
     def send_measurement(self, patient_id, measurement):
-        """Qaytaradi: (SENT | QUEUED | REJECTED, izoh)"""
+        """
+        Qaytaradi: (SENT | QUEUED | REJECTED, izoh, retry_after)
+
+        retry_after — faqat 429 da: server aytgan soniyacha kutish
+        (hujjat, 10-bo'lim). Boshqa QUEUED holatlarda (5xx, tarmoq) None —
+        chaqiruvchi orqaga chekinish (exponential backoff) qo'llaydi.
+        """
         try:
             r = self._post("/clinic/patients/measurement/",
                            {"patient_id": int(patient_id),
                             "measurements": [measurement]})
         except (requests.RequestException, ApiError) as e:
-            return QUEUED, str(e)
+            return QUEUED, str(e), None
 
         if r.status_code == 201:
             # skipped_count=1 — bu o'lchov avval ham yetib borgan (javob
             # yo'lda yo'qolgan). Xato emas: idempotentlik aynan shu.
-            return SENT, r.json().get("message", "")
+            return SENT, r.json().get("message", ""), None
         if r.status_code == 404:
             self._fire(self.on_patient_not_found, patient_id)
-            return REJECTED, error_text(r)
+            return REJECTED, error_text(r), None
         if r.status_code == 400:
-            return REJECTED, error_text(r)
-        return QUEUED, error_text(r)
+            return REJECTED, error_text(r), None
+        if r.status_code == 429:
+            return QUEUED, error_text(r), _parse_retry_after(r)
+        return QUEUED, error_text(r), None
 
     # --- yuz keshi (hujjat, 5-bo'lim) ---
 
@@ -377,21 +417,21 @@ class BodytesterClient:
             params["since"] = since
         r = self._get("/clinic/faces/sync/", params=params)
         if r.status_code != 200:
-            raise ApiError(error_text(r))
+            _raise_for_error(r)
         return r.json()
 
     def faces_sync_page(self, next_link):
         """Javobdagi `next` havolasi bo'yicha keyingi sahifa."""
         r = self._get(next_link)
         if r.status_code != 200:
-            raise ApiError(error_text(r))
+            _raise_for_error(r)
         return r.json()
 
     def faces_ids(self, model_version):
         """GET /clinic/faces/ids/ — total bilan solishtirish uchun."""
         r = self._get("/clinic/faces/ids/", params={"model_version": model_version})
         if r.status_code != 200:
-            raise ApiError(error_text(r))
+            _raise_for_error(r)
         return r.json()
 
 
@@ -520,7 +560,7 @@ class MeasurementQueue:
         """UI dan kelgan o'lchov: diskka yoziladi va darhol yuboriladi."""
         item = self._add(patient_id, measurement)
         cmid = measurement["client_measurement_id"]
-        status, detail = self._send(item)
+        status, detail, _retry_after = self._send(item)
 
         if status == SENT:
             self._remove(cmid)
@@ -533,12 +573,18 @@ class MeasurementQueue:
         return status, detail
 
     def flush(self):
+        """
+        Qaytaradi: navbat ishchisi keyingi urinishgacha qancha kutishi
+        kerak — None (xato yo'q, oddiy interval bilan davom etadi),
+        butun son (429: server aytgan Retry-After soniyasi) yoki
+        BACKOFF (5xx/tarmoq: chaqiruvchi orqaga chekinishni hisoblaydi).
+        """
         with self._lock:
             batch = [dict(i) for i in self._items]
 
         for item in batch:
             cmid = item["measurement"]["client_measurement_id"]
-            status, detail = self._send(item)
+            status, detail, retry_after = self._send(item)
             if status == SENT:
                 self._remove(cmid)
                 log.info("Navbatdagi o'lchov yuborildi: %s", cmid)
@@ -548,18 +594,28 @@ class MeasurementQueue:
             else:
                 self._mark_failed(cmid, detail)
                 log.warning("Navbat: hali yuborib bo'lmadi — %s", detail)
-                break          # tarmoq yo'q — qolganlarini urinib o'tirmaymiz
+                return retry_after if retry_after is not None else BACKOFF
+        return None
 
     def start_worker(self, interval=30):
         def loop():
             delay = 5          # ishga tushgach tez: o'chib-yonishdan qolganlar
+            backoff = RETRY_BACKOFF_START
             while True:
                 time.sleep(delay)
-                delay = interval
                 try:
-                    if self.pending():
-                        self.flush()
+                    if not self.pending():
+                        delay, backoff = interval, RETRY_BACKOFF_START
+                        continue
+                    result = self.flush()
+                    if result is None:
+                        delay, backoff = interval, RETRY_BACKOFF_START
+                    elif result is BACKOFF:
+                        delay, backoff = backoff, min(backoff * 2, RETRY_BACKOFF_MAX)
+                    else:
+                        delay, backoff = result, RETRY_BACKOFF_START
                 except Exception:
                     log.exception("Navbat ishchisi xatosi")
+                    delay, backoff = backoff, min(backoff * 2, RETRY_BACKOFF_MAX)
 
         threading.Thread(target=loop, daemon=True, name="bodytester-queue").start()

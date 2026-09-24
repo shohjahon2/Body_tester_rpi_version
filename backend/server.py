@@ -489,7 +489,7 @@ class FaceEnrollRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     gender: Optional[str] = None
-    age: Optional[int] = None
+    birth_date: Optional[str] = None  # kalendardan ISO 8601, masalan "1992-05-17"
     phone_number: Optional[str] = None
 
 
@@ -523,7 +523,8 @@ def face_identify(req: FaceIdentifyRequest):
     if local is not None:
         patient_id, similarity, name = local
         resp = {"status": "found", "patient_id": patient_id,
-                "similarity": similarity, "source": "cache"}
+                "similarity": similarity, "source": "cache",
+                "embedding": embedding, "quality_score": quality_score}
         if name:
             resp["name"] = name
         return resp
@@ -532,6 +533,14 @@ def face_identify(req: FaceIdentifyRequest):
         identify_result = api_client.identify(embedding)
     except (bt.ApiError, requests.RequestException) as e:
         return {"status": "error", "detail": str(e)}
+
+    # Embedding/quality_score har doim qo'shiladi (status qandayligidan
+    # qat'i nazar) — "found" bo'lsa ham UI "bu men emasman" deb rad
+    # etganda, xuddi shu vektor bilan yangi bemor sifatida ro'yxatdan
+    # o'tkazish (/face/enroll) uchun kerak. Haqiqiy dublikatni backend
+    # o'zi enroll paytida tekshiradi (possible_duplicate_of, hujjat 7-b.).
+    identify_result["embedding"] = embedding
+    identify_result["quality_score"] = quality_score
 
     if identify_result.get("status") == "found":
         # Server ism qaytaradi (kesh esa hech qachon) — shu bilan birga
@@ -543,9 +552,6 @@ def face_identify(req: FaceIdentifyRequest):
         if full_name:
             identify_result["name"] = full_name
         cache.upsert(identify_result["patient_id"], embedding, name=full_name or None)
-    elif identify_result.get("status") == "not_found":
-        identify_result["embedding"] = embedding
-        identify_result["quality_score"] = quality_score
     return identify_result
 
 
@@ -558,7 +564,7 @@ def face_enroll(req: FaceEnrollRequest):
         "first_name": req.first_name,
         "last_name": req.last_name,
         "gender": req.gender,
-        "age": req.age,
+        "birth_date": req.birth_date,
         "phone_number": req.phone_number,
     }.items() if v is not None}
 

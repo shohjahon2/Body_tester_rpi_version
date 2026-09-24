@@ -1,52 +1,48 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FaPlus, FaMinus } from 'react-icons/fa';
 import Button from '../components/Button';
 import '../styles/pages/_age-input.scss';
 
+// Kiosk API: yosh endi serverga yuborilmaydi — u tug'ilgan sanadan
+// serverning o'zi hisoblaydi (tug'ilgan kun o'tgan-o'tmaganini ham
+// hisobga olib). Shuning uchun kalendardan ANIQ sana olinadi, ISO 8601
+// ko'rinishida ("1992-05-17"). Kelajakdagi sana va 120 yoshdan katta
+// sana server tomonidan rad etiladi — shu chegaralar kalendarda ham
+// qo'yiladi (min/max).
+const toIsoDate = (date) => date.toISOString().slice(0, 10);
+const todayIso = () => toIsoDate(new Date());
+const minIsoDate = () => {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() - 120);
+  return toIsoDate(d);
+};
+
 const AgeInput = () => {
   const navigate = useNavigate();
-  const [age, setAge] = useState(0);
+  const [birthDate, setBirthDate] = useState('');
+  const [error, setError] = useState('');
 
   useEffect(() => {
     // Kiosk API: yuz orqali taniqli bemor (patientId bor, hali
     // ro'yxatdan o'tkazilishi kerak bo'lgan pendingEmbedding yo'q) —
-    // yoshi allaqachon backendda bor, qayta so'ralmaydi.
+    // tug'ilgan sanasi allaqachon backendda bor, qayta so'ralmaydi.
     const known = localStorage.getItem('patientId') && !localStorage.getItem('pendingEmbedding');
     if (known) {
       navigate('/selection', { replace: true });
     }
   }, [navigate]);
 
-  const handleDecrease = () => {
-    if (age > 0) {
-      setAge(age - 1);
-    }
-  };
-
-  const handleIncrease = () => {
-    setAge(age + 1);
-  };
-
-  const handleInputChange = (e) => {
-    const value = e.target.value;
-   
-    if (value === '' || /^\d+$/.test(value)) {
-      const numValue = value === '' ? 0 : parseInt(value, 10);
-      setAge(numValue);
-    }
-  };
-
-  const handleInputBlur = (e) => {
-    // Ensure age is at least 0 when input loses focus
-    if (e.target.value === '' || parseInt(e.target.value, 10) < 0) {
-      setAge(0);
-    }
+  const handleDateChange = (e) => {
+    setBirthDate(e.target.value);
+    setError('');
   };
 
   const handleNext = () => {
-    // Save age to localStorage
-    localStorage.setItem('age', age.toString());
+    if (!birthDate) {
+      setError("Iltimos, tug'ilgan sanangizni tanlang");
+      return;
+    }
+    localStorage.setItem('birthDate', birthDate);
     navigate('/selection');
   };
 
@@ -54,37 +50,22 @@ const AgeInput = () => {
     <div className="age-input">
       <div className="age-input__container">
         <div className="age-input__content">
-          <h2 className="age-input__title">Iltimos yoshingizni kirting</h2>
-          
+          <h2 className="age-input__title">Iltimos tug'ilgan sanangizni kiriting</h2>
+
           <div className="age-input__controls">
-            <button 
-              className="age-input__button age-input__button--minus"
-              onClick={handleDecrease}
-              aria-label="Decrease age"
-            >
-              <FaMinus />
-            </button>
-            
             <input
-              type="text"
+              type="date"
               className="age-input__display"
-              value={age}
-              onChange={handleInputChange}
-              onBlur={handleInputBlur}
-              inputMode="numeric"
-              pattern="[0-9]*"
-              aria-label="Enter age"
+              value={birthDate}
+              onChange={handleDateChange}
+              min={minIsoDate()}
+              max={todayIso()}
+              aria-label="Tug'ilgan sanangizni tanlang"
             />
-            
-            <button 
-              className="age-input__button age-input__button--plus"
-              onClick={handleIncrease}
-              aria-label="Increase age"
-            >
-              <FaPlus />
-            </button>
           </div>
-          
+
+          {error && <p className="age-input__error">{error}</p>}
+
           <div className="age-input__next-wrapper">
             <Button onClick={handleNext} className="age-input__next-button">
               Keyingisi

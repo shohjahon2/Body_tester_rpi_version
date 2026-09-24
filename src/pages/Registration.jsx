@@ -240,9 +240,11 @@ const Registration = () => {
         if (result.status === 'found') {
           // Bemor topildi — lekin darhol o'tib ketmasdan, avval "bu
           // sizmisiz?" deb tasdiqlash so'raladi (xato moslik bo'lsa
-          // bekor qilish imkoni bo'lsin).
+          // bekor qilish imkoni bo'lsin). Kadr ("photo") shu yerda
+          // saqlanadi — "Yo'q" bosilsa, kamera endi ochiq bo'lmaydi va
+          // yangidan olib bo'lmaydi.
           setStatus('');
-          setConfirmResult(result);
+          setConfirmResult({ ...result, photo: frameData });
         } else if (result.status === 'not_found') {
           // Yangi odam — kadr saqlanadi, ism kiritish uchun to'xtaymiz.
           setPhoto(frameData);
@@ -278,11 +280,21 @@ const Registration = () => {
   };
 
   const confirmNo = () => {
-    // Noto'g'ri moslik — bekor qilib, qaytadan skanerlashni davom
-    // ettiramiz. Hech narsa saqlanmagan edi (localStorage'ga hali
-    // yozilmagan), shuning uchun tozalash shart emas.
-    setConfirmResult(null);
+    // "Bu men emasman" — kiosk qat'iy bloklamaydi: xuddi yangi bemor
+    // kadr olganidek, ism/tug'ilgan sana bosqichiga o'tkazamiz va
+    // shu embedding bilan /face/enroll chaqiriladi. Haqiqiy dublikatni
+    // backendning o'zi enroll paytida aniqlaydi (possible_duplicate_of,
+    // hujjat 7-bo'lim) — kiosk buni oldindan hal qilishga urinmaydi.
+    if (!confirmResult) return;
+    setPhoto(confirmResult.photo);
     setStatus('');
+    stopCamera();
+    localStorage.setItem('pendingEmbedding', JSON.stringify({
+      embedding: confirmResult.embedding,
+      quality_score: confirmResult.quality_score,
+    }));
+    localStorage.removeItem('patientId');
+    setConfirmResult(null);
     goodStreakRef.current = 0;
   };
 

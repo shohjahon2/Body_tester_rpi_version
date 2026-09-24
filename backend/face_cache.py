@@ -35,6 +35,12 @@ def decode_embedding(b64):
     return (v / n) if n else v
 
 
+def _upsert_name(upsert):
+    """Sinxronlash yozuvidagi first_name+last_name -> to'liq ism (hujjat, 5.1-bo'lim)."""
+    full = " ".join(x for x in [upsert.get("first_name"), upsert.get("last_name")] if x).strip()
+    return full or None
+
+
 class FaceCache:
     """
     Xotirada (tez qidirish uchun) va diskda (qayta yoqilganda yo'qolmasin
@@ -128,10 +134,10 @@ class FaceCache:
 
     def upsert(self, patient_id, embedding, name=None):
         """
-        name berilmasa (masalan sinxronlashdan kelgan yozuv — server hech
-        qachon ism yubormaydi), mavjud ism o'zgarmay qoladi — COALESCE shu
-        uchun. Ism faqat ro'yxatdan o'tkazishda yoki server orqali
-        tanishda (u ismni qaytarganda) beriladi.
+        name berilmasa, mavjud ism o'zgarmay qoladi — COALESCE shu uchun.
+        Ism ro'yxatdan o'tkazishda, server orqali tanishda va sinxronlashda
+        (hujjat, 5.1-bo'lim: upserts first_name/last_name beradi) kelishi
+        mumkin.
         """
         vec = np.asarray(embedding, dtype=np.float32)
         with self._lock:
@@ -153,15 +159,15 @@ class FaceCache:
 
     def replace_all(self, rows):
         """
-        rows: [(patient_id, vektor), ...]. Bitta tranzaksiyada almashtiriladi —
-        hujjat: "to'liq nusxa yarim yo'lda uzilsa, eski kesh o'z joyida qolishi
-        kerak" — shu sabab chaqiruvchi (sync) hamma sahifani avval yig'ib,
-        faqat oxirida shu metodni chaqiradi.
+        rows: [(patient_id, vektor, ism yoki None), ...]. Bitta tranzaksiyada
+        almashtiriladi — hujjat: "to'liq nusxa yarim yo'lda uzilsa, eski
+        kesh o'z joyida qolishi kerak" — shu sabab chaqiruvchi (sync) hamma
+        sahifani avval yig'ib, faqat oxirida shu metodni chaqiradi.
 
-        Server sinxronlashda hech qachon ism yubormaydi — shuning uchun
-        avval mavjud (lokal bilingan) ismlarni saqlab qolamiz, keyin
-        qayta tiklaymiz, aks holda har to'liq sinxronlashda ismlar
-        o'chib ketardi.
+        Server sinxronlashda first_name/last_name'ni ham yuboradi (hujjat,
+        5.1-bo'lim). Agar biror yozuvda ism bo'lmasa (masalan eski server),
+        mavjud (lokal bilingan) ism saqlab qolinadi — aks holda har to'liq
+        sinxronlashda ismlar o'chib ketardi.
         """
         with self._lock:
             existing_names = dict(
@@ -172,8 +178,9 @@ class FaceCache:
             self._db.execute("DELETE FROM faces")
             self._db.executemany(
                 "INSERT INTO faces(patient_id, embedding, name) VALUES (?, ?, ?)",
-                [(int(pid), np.asarray(v, dtype=np.float32).tobytes(), existing_names.get(int(pid)))
-                 for pid, v in rows],
+                [(int(pid), np.asarray(v, dtype=np.float32).tobytes(),
+                  name or existing_names.get(int(pid)))
+                 for pid, v, name in rows],
             )
             self._db.commit()
             self._load()
@@ -285,13 +292,14 @@ def _sync_locked(client, cache, model_version, allow_reconcile=True):
     cursor = page.get("cursor")
     total = page.get("total")
 
-    rows = [(u["patient_id"], decode_embedding(u["embedding"])) for u in staged_upserts]
+    rows = [(u["patient_id"], decode_embedding(u["embedding"]), _upsert_name(u))
+            for u in staged_upserts]
 
     if is_full:
         cache.replace_all(rows)
     else:
-        for pid, vec in rows:
-            cache.upsert(pid, vec)
+        for pid, vec, name in rows:
+            cache.upsert(pid, vec, name=name)
         for pid in staged_removed:
             cache.remove(pid)
 
@@ -331,21 +339,35 @@ def _reconcile(client, cache, model_version):
         _sync_locked(client, cache, model_version, allow_reconcile=False)
 
 
+_SYNC_BACKOFF_START = 30
+_SYNC_BACKOFF_MAX = 30 * 60
+
+
 def start_sync_worker(client, cache, model_version, interval=3600):
     """
     Hujjat, 3-bo'lim: token olingandan keyin darhol, so'ng har soatda.
     Token o'zi ham shu birinchi chaqiruvda (lazy) olinadi.
+
+    Xato bo'lsa hujjat, 10-bo'lim: 429'da server aytgan Retry-After
+    sarlavhasi hurmat qilinadi; boshqa xatolarda (5xx, tarmoq uzilishi)
+    orqaga chekinish (30s -> 60s -> ... -> 30 daqiqagacha).
     """
     def loop():
         delay = 5
+        backoff = _SYNC_BACKOFF_START
         while True:
             time.sleep(delay)
-            delay = interval
             try:
                 sync(client, cache, model_version)
                 cache.set_meta(last_sync_error="")
+                delay, backoff = interval, _SYNC_BACKOFF_START
             except Exception as e:
                 log.exception("Yuz keshini sinxronlashda xato")
                 cache.set_meta(last_sync_error=str(e))
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after:
+                    delay, backoff = retry_after, _SYNC_BACKOFF_START
+                else:
+                    delay, backoff = backoff, min(backoff * 2, _SYNC_BACKOFF_MAX)
 
     threading.Thread(target=loop, daemon=True, name="bodytester-face-sync").start()

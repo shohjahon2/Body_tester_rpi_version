@@ -68,15 +68,16 @@ const GenderSelection = () => {
     // Store gender selection
     localStorage.setItem('gender', gender);
 
-    // Kiosk API: yangi bemor uchun, yosh+jins ma'lum bo'lgani uchun
-    // ro'yxatdan o'tkazish (enroll).
+    // Kiosk API: yangi bemor uchun, tug'ilgan sana+jins ma'lum bo'lgani
+    // uchun ro'yxatdan o'tkazish (enroll). Yosh yuborilmaydi — server
+    // birth_date'dan o'zi hisoblaydi (hujjat, 7-bo'lim).
     const userData = JSON.parse(localStorage.getItem('userData') || '{}');
     const pendingEmbeddingRaw = localStorage.getItem('pendingEmbedding');
 
     if (!userData.isGuest && pendingEmbeddingRaw) {
       try {
         const pending = JSON.parse(pendingEmbeddingRaw);
-        const age = parseInt(localStorage.getItem('age') || '0', 10);
+        const birthDate = localStorage.getItem('birthDate') || undefined;
         const res = await fetch('http://localhost:8000/face/enroll', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -85,7 +86,7 @@ const GenderSelection = () => {
             quality_score: pending.quality_score,
             first_name: userData.name,
             gender: gender === 'male' ? 'M' : 'F',
-            age: age || undefined,
+            birth_date: birthDate,
           }),
         });
         const result = await res.json();
